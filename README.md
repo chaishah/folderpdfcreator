@@ -39,6 +39,7 @@ python merge_to_pdf.py FOLDER [OPTIONS]
 | `-o, --output PATH` | Output PDF path. Defaults to `<folder>/<folder_name>.pdf` |
 | `--compress` | Lossless compression — deflates streams and deduplicates objects. Best for text/vector PDFs. |
 | `--image-quality 1-95` | Re-encodes all embedded images as JPEG at the given quality (implies `--compress`). Best for scans and photos. |
+| `--extract-metadata` | Extract EXIF/image metadata from all image files and save to a `.metadata.txt` file alongside the output PDF. |
 | `--skip-errors` | Skip files that fail to convert instead of aborting the whole run. |
 | `--help` | Show help and exit. |
 
@@ -71,6 +72,16 @@ python merge_to_pdf.py "C:\path\to\MyFolder" --image-quality 60
 python merge_to_pdf.py "C:\path\to\MyFolder" --image-quality 40
 ```
 
+**Extract image metadata to a text file:**
+```bash
+python merge_to_pdf.py "C:\path\to\MyFolder" --extract-metadata
+```
+
+**Combine metadata extraction with compression:**
+```bash
+python merge_to_pdf.py "C:\path\to\MyFolder" --extract-metadata --image-quality 85
+```
+
 **Skip broken files instead of aborting:**
 ```bash
 python merge_to_pdf.py "C:\path\to\MyFolder" --image-quality 85 --skip-errors
@@ -94,6 +105,48 @@ The output file is automatically excluded from the input list, so running the co
 - Images that end up **larger** after recompression are kept at their original encoding automatically.
 - Tiny images (icons, signatures < 100×100 px) are skipped to preserve quality.
 - `--image-quality` always implies `--compress`.
+
+## Metadata extraction
+
+When `--extract-metadata` is passed, a `<output_name>.metadata.txt` file is written alongside the PDF containing:
+
+- **Basic info** (always): filename, format, colour mode, dimensions, file size
+- **EXIF data** (when present): date taken, camera make/model, exposure time, f-number, ISO, focal length, lens model, GPS coordinates, and more
+
+Files with no EXIF data (e.g. screenshots, programmatically generated PNGs) still get their basic info recorded. Only image files are included — PDFs, Word docs, and emails are skipped.
+
+**Example output (`MyFolder.metadata.txt`):**
+```
+Image Metadata Report
+Generated from: C:\path\to\MyFolder
+========================================================================
+
+========================================================================
+  1.jpg
+========================================================================
+  Filename         : 1.jpg
+  Format           : JPEG
+  Mode             : RGB
+  Dimensions       : 4032 x 3024 px
+  File size        : 4.2 MB
+  Date modified    : 2024:03:15 14:32:11
+  Date taken       : 2024:03:15 14:32:11
+  Camera make      : Apple
+  Camera model     : iPhone 15 Pro
+  Exposure time    : 1/120
+  F-number         : 18/10
+  ISO              : 200
+  GPS coordinates  : 37.774967 N, 122.419467 W
+
+========================================================================
+  2.png
+========================================================================
+  Filename    : 2.png
+  Format      : PNG
+  Mode        : RGB
+  Dimensions  : 1920 x 1080 px
+  File size   : 890.4 KB
+```
 
 ## Output
 

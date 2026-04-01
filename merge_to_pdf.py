@@ -184,6 +184,146 @@ def msg_to_pdf(src: Path, tmp_dir: str) -> Path:
 
 
 # ---------------------------------------------------------------------------
+# Image metadata extraction
+# ---------------------------------------------------------------------------
+
+# EXIF tags we want to present in a human-readable way
+_EXIF_FRIENDLY: dict[str, str] = {
+    "DateTime":          "Date modified",
+    "DateTimeOriginal":  "Date taken",
+    "DateTimeDigitized": "Date digitised",
+    "Make":              "Camera make",
+    "Model":             "Camera model",
+    "Software":          "Software",
+    "Artist":            "Artist",
+    "Copyright":         "Copyright",
+    "ImageDescription":  "Description",
+    "ExposureTime":      "Exposure time",
+    "FNumber":           "F-number",
+    "ISOSpeedRatings":   "ISO",
+    "FocalLength":       "Focal length",
+    "Flash":             "Flash",
+    "Orientation":       "Orientation",
+    "XResolution":       "X resolution",
+    "YResolution":       "Y resolution",
+    "ResolutionUnit":    "Resolution unit",
+    "ColorSpace":        "Colour space",
+    "ExifImageWidth":    "Exif width",
+    "ExifImageHeight":   "Exif height",
+    "LensMake":          "Lens make",
+    "LensModel":         "Lens model",
+}
+
+_GPS_REF = {1: "GPSLatitudeRef", 2: "GPSLatitude", 3: "GPSLongitudeRef", 4: "GPSLongitude"}
+
+
+def _dms_to_decimal(dms: tuple, ref: str) -> float:
+    d, m, s = (float(x) for x in dms)
+    decimal = d + m / 60 + s / 3600
+    return -decimal if ref in ("S", "W") else decimal
+
+
+def _fmt_gps(gps_ifd: dict) -> str | None:
+    try:
+        lat = _dms_to_decimal(gps_ifd[2], gps_ifd[1])
+        lon = _dms_to_decimal(gps_ifd[4], gps_ifd[3])
+        lat_dir = "N" if lat >= 0 else "S"
+        lon_dir = "E" if lon >= 0 else "W"
+        return f"{abs(lat):.6f} {lat_dir}, {abs(lon):.6f} {lon_dir}"
+    except Exception:
+        return None
+
+
+def extract_image_metadata(src: Path) -> dict | None:
+    """Return a dict of metadata fields for an image file, or None on failure."""
+    from PIL import ExifTags, Image
+
+    try:
+        img = Image.open(src)
+    except Exception:
+        return None
+
+    fields: dict[str, str] = {
+        "Filename":   src.name,
+        "Format":     img.format or "unknown",
+        "Mode":       img.mode,
+        "Dimensions": f"{img.width} x {img.height} px",
+        "File size":  _fmt_size(src.stat().st_size),
+    }
+
+    try:
+        exif = img.getexif()
+    except Exception:
+        exif = {}
+
+    if exif:
+        tag_map = {v: k for k, v in ExifTags.TAGS.items()}  # name -> id
+
+        # Merge main IFD with the Exif sub-IFD (holds DateTimeOriginal, ISO, etc.)
+        all_tags: dict = dict(exif)
+        try:
+            all_tags.update(exif.get_ifd(ExifTags.IFD.Exif))
+        except Exception:
+            pass
+
+        for tag_name, friendly_label in _EXIF_FRIENDLY.items():
+            tag_id = tag_map.get(tag_name)
+            if tag_id is None:
+                continue
+            value = all_tags.get(tag_id)
+            if value is None:
+                continue
+            # Format rational numbers neatly
+            if hasattr(value, "numerator"):
+                value = f"{value.numerator}/{value.denominator}" if value.denominator != 1 else str(value.numerator)
+            fields[friendly_label] = str(value).strip()
+
+        # GPS block
+        try:
+            gps_ifd = exif.get_ifd(ExifTags.IFD.GPSInfo)
+            if gps_ifd:
+                gps_str = _fmt_gps(gps_ifd)
+                if gps_str:
+                    fields["GPS coordinates"] = gps_str
+        except Exception:
+            pass
+
+    return fields
+
+
+def write_metadata_file(entries: list[tuple[Path, dict | None]], output: Path) -> int:
+    """Write metadata for all images to a text file. Returns count of files with EXIF."""
+    sep = "=" * 72
+    has_exif_count = 0
+
+    with open(output, "w", encoding="utf-8") as fh:
+        fh.write(f"Image Metadata Report\n")
+        fh.write(f"Generated from: {output.parent}\n")
+        fh.write(f"{sep}\n\n")
+
+        for src, fields in entries:
+            fh.write(f"{sep}\n")
+            fh.write(f"  {src.name}\n")
+            fh.write(f"{sep}\n")
+
+            if fields is None:
+                fh.write("  (could not read file)\n\n")
+                continue
+
+            # Check if any real EXIF beyond basic file info was found
+            exif_keys = set(fields) - {"Filename", "Format", "Mode", "Dimensions", "File size"}
+            if exif_keys:
+                has_exif_count += 1
+
+            label_width = max(len(k) for k in fields) + 2
+            for label, value in fields.items():
+                fh.write(f"  {label:<{label_width}}: {value}\n")
+            fh.write("\n")
+
+    return has_exif_count
+
+
+# ---------------------------------------------------------------------------
 # Merger + compression
 # ---------------------------------------------------------------------------
 def _fmt_size(n_bytes: int) -> str:
@@ -323,6 +463,12 @@ def compress_pdf(src: Path, output: Path, image_quality: int | None = None) -> N
     ),
 )
 @click.option(
+    "--extract-metadata",
+    is_flag=True,
+    default=False,
+    help="Extract EXIF/image metadata and save to a .txt file alongside the output PDF.",
+)
+@click.option(
     "--skip-errors",
     is_flag=True,
     default=False,
@@ -333,6 +479,7 @@ def main(
     output: str | None,
     compress: bool,
     image_quality: int | None,
+    extract_metadata: bool,
     skip_errors: bool,
 ) -> None:
     """Merge all supported files in FOLDER into a single PDF.
@@ -376,6 +523,24 @@ def main(
     for f in files:
         click.echo(f"  {f.name}")
     click.echo()
+
+    # --- metadata extraction (images only) ----------------------------------
+    if extract_metadata:
+        image_files = [f for f in files if f.suffix.lower() in IMAGE_EXTS]
+        if not image_files:
+            click.echo(click.style("No image files found — skipping metadata extraction.", fg="yellow"))
+        else:
+            meta_path = output_path.with_suffix(".metadata.txt")
+            entries = [(f, extract_image_metadata(f)) for f in image_files]
+            exif_count = write_metadata_file(entries, meta_path)
+            click.echo(
+                click.style(
+                    f"Metadata written: {meta_path}"
+                    f"  ({exif_count}/{len(image_files)} image(s) had EXIF data)",
+                    fg="cyan",
+                )
+            )
+            click.echo()
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         pdf_parts: list[Path] = []
