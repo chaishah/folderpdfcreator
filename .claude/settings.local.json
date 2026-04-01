@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip list:*)",
+      "Bash(pip install:*)",
+      "Bash(python merge_to_pdf.py --help)",
+      "Bash(python merge_to_pdf.py test_files -o test_files/output.pdf)",
+      "Bash(python:*)"
+    ]
+  }
+}
