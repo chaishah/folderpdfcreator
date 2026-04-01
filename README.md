@@ -22,17 +22,40 @@ pip install -r requirements.txt
 
 ## Usage
 
+### Interactive mode (recommended)
+
+Run with no arguments to launch the interactive prompt — no flags to memorise:
+
+```bash
+python merge_to_pdf.py
+```
+
+Use arrow keys to navigate, Enter to confirm. The prompt walks you through:
+
+1. **Folder** — path with tab-completion
+2. **Output path** — pre-filled with the default, edit if needed
+3. **Compression** — choose with arrow keys:
+   - None (merge only)
+   - Lossless (deflate + deduplicate)
+   - Image recompression (re-encode as JPEG — best for scans/photos)
+4. **Image quality** — shown only when image recompression is selected
+5. **Extract metadata** — yes/no
+6. **Skip errors** — yes/no
+7. **Summary + confirm** before anything runs
+
+### Command-line mode
+
 ```bash
 python merge_to_pdf.py FOLDER [OPTIONS]
 ```
 
-### Arguments
+#### Arguments
 
 | Argument | Description |
 |----------|-------------|
 | `FOLDER` | Path to the folder containing the files to merge |
 
-### Options
+#### Options
 
 | Option | Description |
 |--------|-------------|
@@ -41,9 +64,14 @@ python merge_to_pdf.py FOLDER [OPTIONS]
 | `--image-quality 1-95` | Re-encodes all embedded images as JPEG at the given quality (implies `--compress`). Best for scans and photos. |
 | `--extract-metadata` | Extract EXIF/image metadata from all image files and save to a `.metadata.txt` file alongside the output PDF. |
 | `--skip-errors` | Skip files that fail to convert instead of aborting the whole run. |
-| `--help` | Show help and exit. |
+| `-h, --help` | Show help and exit. |
 
 ## Examples
+
+**Interactive mode:**
+```bash
+python merge_to_pdf.py
+```
 
 **Basic merge** — output saved to `MyFolder/MyFolder.pdf`:
 ```bash

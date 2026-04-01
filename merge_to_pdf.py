@@ -437,67 +437,18 @@ def compress_pdf(src: Path, output: Path, image_quality: int | None = None) -> N
 
 
 # ---------------------------------------------------------------------------
-# CLI
+# Core execution (shared by CLI and interactive mode)
 # ---------------------------------------------------------------------------
-@click.command()
-@click.argument("folder", type=click.Path(exists=True, file_okay=False, resolve_path=True))
-@click.option(
-    "-o", "--output",
-    default=None,
-    help="Output PDF path. Defaults to <folder>/<folder_name>.pdf",
-)
-@click.option(
-    "--compress",
-    is_flag=True,
-    default=False,
-    help="Lossless compression: deflate streams + deduplicate objects.",
-)
-@click.option(
-    "--image-quality",
-    type=click.IntRange(1, 95),
-    default=None,
-    metavar="1-95",
-    help=(
-        "Re-encode embedded images as JPEG at this quality (implies --compress). "
-        "Good values: 85 = high quality, 60 = medium, 40 = small file."
-    ),
-)
-@click.option(
-    "--extract-metadata",
-    is_flag=True,
-    default=False,
-    help="Extract EXIF/image metadata and save to a .txt file alongside the output PDF.",
-)
-@click.option(
-    "--skip-errors",
-    is_flag=True,
-    default=False,
-    help="Skip files that fail to convert instead of aborting.",
-)
-def main(
-    folder: str,
-    output: str | None,
+def _execute_merge(
+    folder_path: Path,
+    output_path: Path,
     compress: bool,
     image_quality: int | None,
     extract_metadata: bool,
     skip_errors: bool,
 ) -> None:
-    """Merge all supported files in FOLDER into a single PDF.
-
-    Files are sorted numerically by filename (e.g. 1.png, 2.docx, 10.pdf).
-
-    \b
-    Compression options:
-      --compress              lossless (structure only)
-      --image-quality 85      lossy image recompression — use this for scans/photos
-    """
-    folder_path = Path(folder)
-    output_path = Path(output) if output else folder_path / f"{folder_path.name}.pdf"
-
-    # image-quality implies compress
     do_compress = compress or (image_quality is not None)
 
-    # Collect supported files, excluding the output file itself
     files = sorted(
         [
             f for f in folder_path.iterdir()
@@ -524,7 +475,6 @@ def main(
         click.echo(f"  {f.name}")
     click.echo()
 
-    # --- metadata extraction (images only) ----------------------------------
     if extract_metadata:
         image_files = [f for f in files if f.suffix.lower() in IMAGE_EXTS]
         if not image_files:
@@ -600,6 +550,161 @@ def main(
 
     click.echo()
     click.echo(click.style(f"Done! -> {output_path}  [{size_info}]", fg="green", bold=True))
+
+
+# ---------------------------------------------------------------------------
+# Interactive mode
+# ---------------------------------------------------------------------------
+_Q_STYLE = None  # lazily initialised after questionary import
+
+
+def _q_style():
+    global _Q_STYLE
+    if _Q_STYLE is None:
+        from questionary import Style
+        _Q_STYLE = Style([
+            ("qmark",       "fg:cyan bold"),
+            ("question",    "bold"),
+            ("answer",      "fg:cyan bold"),
+            ("pointer",     "fg:cyan bold"),
+            ("highlighted", "fg:cyan bold"),
+            ("selected",    "fg:green"),
+            ("instruction", "fg:grey"),
+            ("text",        ""),
+        ])
+    return _Q_STYLE
+
+
+def _ask(prompt_fn, *args, **kwargs):
+    """Call a questionary prompt and exit cleanly on Ctrl-C / Ctrl-D."""
+    result = prompt_fn(*args, style=_q_style(), **kwargs).ask()
+    if result is None:
+        click.echo("\nCancelled.")
+        sys.exit(0)
+    return result
+
+
+def interactive_mode() -> None:
+    import questionary
+
+    click.echo(click.style("\n  Folder PDF Merger\n", bold=True))
+
+    # ── folder ───────────────────────────────────────────────────────────────
+    folder_str = _ask(
+        questionary.path,
+        "Folder to merge:",
+        only_directories=True,
+    )
+    folder_path = Path(folder_str).expanduser().resolve()
+    if not folder_path.is_dir():
+        click.echo(click.style(f"Error: '{folder_path}' is not a directory.", fg="red"))
+        sys.exit(1)
+
+    # ── output path ──────────────────────────────────────────────────────────
+    default_out = str(folder_path / f"{folder_path.name}.pdf")
+    output_str = _ask(
+        questionary.text,
+        "Output PDF path:",
+        default=default_out,
+    )
+    output_path = Path(output_str).expanduser()
+
+    # ── compression mode ─────────────────────────────────────────────────────
+    compress_choice = _ask(
+        questionary.select,
+        "Compression:",
+        choices=[
+            questionary.Choice("None  —  merge only",                                        value="none"),
+            questionary.Choice("Lossless  —  deflate streams & deduplicate objects",          value="lossless"),
+            questionary.Choice("Image recompression  —  re-encode as JPEG (best for scans)",  value="images"),
+        ],
+    )
+
+    image_quality: int | None = None
+    if compress_choice == "images":
+        quality_str = _ask(
+            questionary.text,
+            "Image quality (1-95):",
+            default="85",
+            validate=lambda v: (v.isdigit() and 1 <= int(v) <= 95) or "Enter a whole number between 1 and 95",
+        )
+        image_quality = int(quality_str)
+
+    # ── extra options ─────────────────────────────────────────────────────────
+    extract_metadata = _ask(questionary.confirm, "Extract image metadata to a .txt file?", default=False)
+    skip_errors      = _ask(questionary.confirm, "Skip files that fail to convert?",       default=False)
+
+    # ── summary + confirm ────────────────────────────────────────────────────
+    click.echo()
+    click.echo(click.style("  Summary", bold=True))
+    click.echo(f"  Folder     : {folder_path}")
+    click.echo(f"  Output     : {output_path}")
+    if compress_choice == "none":
+        click.echo( "  Compression: None")
+    elif compress_choice == "lossless":
+        click.echo( "  Compression: Lossless")
+    else:
+        click.echo(f"  Compression: Images at quality {image_quality}")
+    click.echo(f"  Metadata   : {'Yes' if extract_metadata else 'No'}")
+    click.echo(f"  On error   : {'Skip' if skip_errors else 'Abort'}")
+    click.echo()
+
+    if not _ask(questionary.confirm, "Proceed?", default=True):
+        click.echo("Cancelled.")
+        sys.exit(0)
+
+    click.echo()
+    _execute_merge(
+        folder_path=folder_path,
+        output_path=output_path,
+        compress=(compress_choice == "lossless"),
+        image_quality=image_quality,
+        extract_metadata=extract_metadata,
+        skip_errors=skip_errors,
+    )
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+@click.command(context_settings={"help_option_names": ["-h", "--help"]})
+@click.argument("folder", required=False, default=None,
+                type=click.Path(exists=False, file_okay=False))
+@click.option("-o", "--output",        default=None, help="Output PDF path. Defaults to <folder>/<folder_name>.pdf")
+@click.option("--compress",            is_flag=True, default=False, help="Lossless compression: deflate streams + deduplicate objects.")
+@click.option("--image-quality",       type=click.IntRange(1, 95),  default=None, metavar="1-95",
+              help="Re-encode images as JPEG at this quality (implies --compress). 85=high, 60=medium, 40=small.")
+@click.option("--extract-metadata",    is_flag=True, default=False, help="Save EXIF/image metadata to a .txt file alongside the output PDF.")
+@click.option("--skip-errors",         is_flag=True, default=False, help="Skip files that fail to convert instead of aborting.")
+def main(
+    folder: str | None,
+    output: str | None,
+    compress: bool,
+    image_quality: int | None,
+    extract_metadata: bool,
+    skip_errors: bool,
+) -> None:
+    """Merge all supported files in FOLDER into a single PDF.
+
+    Run with no arguments to launch interactive mode.
+
+    \b
+    Files are sorted numerically (1.png, 2.docx, 10.pdf …).
+    Compression options:
+      --compress              lossless (structure only)
+      --image-quality 85      lossy image recompression — best for scans/photos
+    """
+    if folder is None:
+        interactive_mode()
+        return
+
+    folder_path = Path(folder).resolve()
+    if not folder_path.is_dir():
+        click.echo(click.style(f"Error: '{folder_path}' is not a directory.", fg="red"), err=True)
+        sys.exit(1)
+
+    output_path = Path(output) if output else folder_path / f"{folder_path.name}.pdf"
+    _execute_merge(folder_path, output_path, compress, image_quality, extract_metadata, skip_errors)
 
 
 if __name__ == "__main__":
