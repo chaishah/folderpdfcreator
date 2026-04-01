@@ -184,9 +184,18 @@ def msg_to_pdf(src: Path, tmp_dir: str) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# Merger
+# Merger + compression
 # ---------------------------------------------------------------------------
+def _fmt_size(n_bytes: int) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n_bytes < 1024:
+            return f"{n_bytes:.1f} {unit}"
+        n_bytes /= 1024
+    return f"{n_bytes:.1f} TB"
+
+
 def merge_pdfs(pdf_paths: list[Path], output: Path) -> None:
+    """Merge PDF files into one with no compression applied."""
     from pypdf import PdfWriter
 
     writer = PdfWriter()
@@ -194,6 +203,97 @@ def merge_pdfs(pdf_paths: list[Path], output: Path) -> None:
         writer.append(str(p))
     with open(output, "wb") as fh:
         writer.write(fh)
+
+
+def _recompress_images(pdf: "pikepdf.Pdf", quality: int) -> None:  # noqa: F821
+    """Re-encode every large image in the PDF as JPEG at the given quality."""
+    import io
+
+    import pikepdf
+    from PIL import Image
+
+    processed: set = set()
+
+    for page in pdf.pages:
+        resources = page.get("/Resources")
+        if not resources:
+            continue
+        xobjects = resources.get("/XObject")
+        if not xobjects:
+            continue
+
+        for key in list(xobjects.keys()):
+            xobj = xobjects[key]
+
+            # Track indirect objects so shared images are only processed once
+            try:
+                objgen = xobj.objgen
+                if objgen in processed:
+                    continue
+                processed.add(objgen)
+            except Exception:
+                pass
+
+            if xobj.get("/Subtype") != "/Image":
+                continue
+
+            try:
+                pdfimage = pikepdf.PdfImage(xobj)
+                pil_img = pdfimage.as_pil_image()
+
+                # Skip tiny images (icons, logos, etc.)
+                w, h = pil_img.size
+                if w * h < 10_000:
+                    continue
+
+                # Flatten transparency for JPEG
+                if pil_img.mode == "RGBA":
+                    bg = Image.new("RGB", pil_img.size, (255, 255, 255))
+                    bg.paste(pil_img, mask=pil_img.split()[3])
+                    pil_img = bg
+                elif pil_img.mode not in ("RGB", "L"):
+                    pil_img = pil_img.convert("RGB")
+
+                buf = io.BytesIO()
+                pil_img.save(buf, format="JPEG", quality=quality, optimize=True)
+                jpeg_bytes = buf.getvalue()
+
+                # Only replace if actually smaller than the original stream
+                try:
+                    if len(jpeg_bytes) >= len(xobj.read_raw_bytes()):
+                        continue
+                except Exception:
+                    pass
+
+                cs = "/DeviceGray" if pil_img.mode == "L" else "/DeviceRGB"
+                xobj.write(jpeg_bytes, filter=pikepdf.Name("/DCTDecode"))
+                xobj["/ColorSpace"] = pikepdf.Name(cs)
+                xobj["/Width"] = w
+                xobj["/Height"] = h
+                xobj["/BitsPerComponent"] = 8
+                for remove_key in ("/DecodeParms", "/SMask", "/Mask", "/Intent"):
+                    try:
+                        del xobj[remove_key]
+                    except Exception:
+                        pass
+
+            except Exception:
+                pass  # Leave images that can't be processed untouched
+
+
+def compress_pdf(src: Path, output: Path, image_quality: int | None = None) -> None:
+    """Compress a PDF using pikepdf. Optionally recompress embedded images."""
+    import pikepdf
+
+    with pikepdf.open(str(src)) as pdf:
+        if image_quality is not None:
+            _recompress_images(pdf, image_quality)
+        pdf.save(
+            str(output),
+            compress_streams=True,
+            object_stream_mode=pikepdf.ObjectStreamMode.generate,
+            recompress_flate=True,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -207,19 +307,48 @@ def merge_pdfs(pdf_paths: list[Path], output: Path) -> None:
     help="Output PDF path. Defaults to <folder>/<folder_name>.pdf",
 )
 @click.option(
+    "--compress",
+    is_flag=True,
+    default=False,
+    help="Lossless compression: deflate streams + deduplicate objects.",
+)
+@click.option(
+    "--image-quality",
+    type=click.IntRange(1, 95),
+    default=None,
+    metavar="1-95",
+    help=(
+        "Re-encode embedded images as JPEG at this quality (implies --compress). "
+        "Good values: 85 = high quality, 60 = medium, 40 = small file."
+    ),
+)
+@click.option(
     "--skip-errors",
     is_flag=True,
     default=False,
     help="Skip files that fail to convert instead of aborting.",
 )
-def main(folder: str, output: str | None, skip_errors: bool) -> None:
+def main(
+    folder: str,
+    output: str | None,
+    compress: bool,
+    image_quality: int | None,
+    skip_errors: bool,
+) -> None:
     """Merge all supported files in FOLDER into a single PDF.
 
     Files are sorted numerically by filename (e.g. 1.png, 2.docx, 10.pdf).
+
+    \b
+    Compression options:
+      --compress              lossless (structure only)
+      --image-quality 85      lossy image recompression — use this for scans/photos
     """
     folder_path = Path(folder)
-
     output_path = Path(output) if output else folder_path / f"{folder_path.name}.pdf"
+
+    # image-quality implies compress
+    do_compress = compress or (image_quality is not None)
 
     # Collect supported files, excluding the output file itself
     files = sorted(
@@ -258,7 +387,7 @@ def main(folder: str, output: str | None, skip_errors: bool) -> None:
                 if ext in IMAGE_EXTS:
                     pdf_parts.append(image_to_pdf(f, tmp_dir))
                 elif ext in PDF_EXTS:
-                    pdf_parts.append(f)  # already a PDF — use as-is
+                    pdf_parts.append(f)
                 elif ext in WORD_EXTS:
                     pdf_parts.append(docx_to_pdf(f, tmp_dir))
                 elif ext in EML_EXTS:
@@ -267,11 +396,11 @@ def main(folder: str, output: str | None, skip_errors: bool) -> None:
                     pdf_parts.append(msg_to_pdf(f, tmp_dir))
                 click.echo(click.style(f"  OK  {label}", fg="green"))
             except Exception as exc:
-                msg = f"  ERR {label}: {exc}"
+                err_msg = f"  ERR {label}: {exc}"
                 if skip_errors:
-                    click.echo(click.style(msg, fg="yellow"), err=True)
+                    click.echo(click.style(err_msg, fg="yellow"), err=True)
                 else:
-                    click.echo(click.style(msg, fg="red"), err=True)
+                    click.echo(click.style(err_msg, fg="red"), err=True)
                     sys.exit(1)
 
         if not pdf_parts:
@@ -280,10 +409,32 @@ def main(folder: str, output: str | None, skip_errors: bool) -> None:
 
         click.echo()
         click.echo(f"Merging {len(pdf_parts)} PDF segment(s) ...")
-        merge_pdfs(pdf_parts, output_path)
+
+        if do_compress:
+            raw_path = Path(tmp_dir) / "_merged_raw.pdf"
+            merge_pdfs(pdf_parts, raw_path)
+            raw_size = raw_path.stat().st_size
+
+            if image_quality is not None:
+                click.echo(f"Compressing + recompressing images at quality={image_quality} ...")
+            else:
+                click.echo("Compressing (lossless) ...")
+
+            compress_pdf(raw_path, output_path, image_quality=image_quality)
+            final_size = output_path.stat().st_size
+
+            saved = raw_size - final_size
+            pct = (saved / raw_size * 100) if raw_size else 0
+            size_info = (
+                f"{_fmt_size(raw_size)} -> {_fmt_size(final_size)}"
+                f"  (saved {_fmt_size(saved)}, {pct:.1f}%)"
+            )
+        else:
+            merge_pdfs(pdf_parts, output_path)
+            size_info = _fmt_size(output_path.stat().st_size)
 
     click.echo()
-    click.echo(click.style(f"Done! -> {output_path}", fg="green", bold=True))
+    click.echo(click.style(f"Done! -> {output_path}  [{size_info}]", fg="green", bold=True))
 
 
 if __name__ == "__main__":
