@@ -11,8 +11,9 @@ Supported formats:
 """
 
 import html
-import os
+import io
 import re
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -117,7 +118,6 @@ def docx_to_pdf(src: Path, tmp_dir: str) -> Path:
         convert(str(src), str(out))
         return out
     except Exception:
-        # Fall back to text extraction if Word is not installed
         return _docx_fallback(src, out)
 
 
@@ -128,14 +128,12 @@ def eml_to_pdf(src: Path, tmp_dir: str) -> Path:
     with open(src, "rb") as fh:
         msg = email.message_from_bytes(fh.read(), policy=policy.default)
 
-    # Build header block
     headers = []
     for field in ("From", "To", "CC", "Subject", "Date"):
         val = msg.get(field, "")
         if val:
             headers.append(f"{field}: {val}")
 
-    # Extract plain-text body (prefer text/plain, fall back to stripped HTML)
     body_text = ""
     if msg.is_multipart():
         for part in msg.walk():
@@ -186,8 +184,6 @@ def msg_to_pdf(src: Path, tmp_dir: str) -> Path:
 # ---------------------------------------------------------------------------
 # Image metadata extraction
 # ---------------------------------------------------------------------------
-
-# EXIF tags we want to present in a human-readable way
 _EXIF_FRIENDLY: dict[str, str] = {
     "DateTime":          "Date modified",
     "DateTimeOriginal":  "Date taken",
@@ -213,8 +209,6 @@ _EXIF_FRIENDLY: dict[str, str] = {
     "LensMake":          "Lens make",
     "LensModel":         "Lens model",
 }
-
-_GPS_REF = {1: "GPSLatitudeRef", 2: "GPSLatitude", 3: "GPSLongitudeRef", 4: "GPSLongitude"}
 
 
 def _dms_to_decimal(dms: tuple, ref: str) -> float:
@@ -257,9 +251,7 @@ def extract_image_metadata(src: Path) -> dict | None:
         exif = {}
 
     if exif:
-        tag_map = {v: k for k, v in ExifTags.TAGS.items()}  # name -> id
-
-        # Merge main IFD with the Exif sub-IFD (holds DateTimeOriginal, ISO, etc.)
+        tag_map = {v: k for k, v in ExifTags.TAGS.items()}
         all_tags: dict = dict(exif)
         try:
             all_tags.update(exif.get_ifd(ExifTags.IFD.Exif))
@@ -273,12 +265,10 @@ def extract_image_metadata(src: Path) -> dict | None:
             value = all_tags.get(tag_id)
             if value is None:
                 continue
-            # Format rational numbers neatly
             if hasattr(value, "numerator"):
                 value = f"{value.numerator}/{value.denominator}" if value.denominator != 1 else str(value.numerator)
             fields[friendly_label] = str(value).strip()
 
-        # GPS block
         try:
             gps_ifd = exif.get_ifd(ExifTags.IFD.GPSInfo)
             if gps_ifd:
@@ -297,7 +287,7 @@ def write_metadata_file(entries: list[tuple[Path, dict | None]], output: Path) -
     has_exif_count = 0
 
     with open(output, "w", encoding="utf-8") as fh:
-        fh.write(f"Image Metadata Report\n")
+        fh.write("Image Metadata Report\n")
         fh.write(f"Generated from: {output.parent}\n")
         fh.write(f"{sep}\n\n")
 
@@ -310,7 +300,6 @@ def write_metadata_file(entries: list[tuple[Path, dict | None]], output: Path) -
                 fh.write("  (could not read file)\n\n")
                 continue
 
-            # Check if any real EXIF beyond basic file info was found
             exif_keys = set(fields) - {"Filename", "Format", "Mode", "Dimensions", "File size"}
             if exif_keys:
                 has_exif_count += 1
@@ -324,6 +313,117 @@ def write_metadata_file(entries: list[tuple[Path, dict | None]], output: Path) -
 
 
 # ---------------------------------------------------------------------------
+# PDF utilities: page count, TOC, page numbers, bookmarks
+# ---------------------------------------------------------------------------
+def _count_pdf_pages(path: Path) -> int:
+    """Return the number of pages in a PDF file."""
+    from pypdf import PdfReader
+    return len(PdfReader(str(path)).pages)
+
+
+def _generate_toc_pdf(entries: list[tuple[str, int]], output: Path) -> int:
+    """
+    Render a Table of Contents to *output*.
+
+    entries  : list of (filename, 1-indexed page number in the final merged PDF)
+    Returns  : number of PDF pages written (usually 1; more for very long lists).
+    """
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.units import mm
+    from reportlab.pdfgen import canvas as rl_canvas
+
+    W, H   = A4
+    left   = 20 * mm
+    right  = W - 20 * mm
+    top    = H - 20 * mm
+    bottom = 20 * mm
+    line_h = 6.5 * mm
+
+    buf = io.BytesIO()
+    c   = rl_canvas.Canvas(buf, pagesize=A4)
+    page_count = 1
+
+    # ── Title ──────────────────────────────────────────────────────────────
+    c.setFont("Helvetica-Bold", 15)
+    c.drawString(left, top - 15, "Table of Contents")
+
+    c.setLineWidth(0.6)
+    c.setStrokeColorRGB(0.55, 0.55, 0.55)
+    rule_y = top - 15 - 5 * mm
+    c.line(left, rule_y, right, rule_y)
+
+    y = rule_y - 8 * mm
+
+    # ── Entries ────────────────────────────────────────────────────────────
+    for name, page_num in entries:
+        if y < bottom + line_h:
+            c.showPage()
+            page_count += 1
+            y = top
+            c.setFont("Helvetica", 10)
+
+        # Truncate long filenames
+        display  = name if len(name) <= 68 else name[:65] + "..."
+        page_str = str(page_num)
+
+        c.setFont("Helvetica", 10)
+        name_w = c.stringWidth(display,  "Helvetica", 10)
+        pg_w   = c.stringWidth(page_str, "Helvetica", 10)
+        gap    = 3 * mm
+        dot_w  = c.stringWidth(".", "Helvetica", 10)
+        n_dots = max(3, int(((right - left) - name_w - pg_w - 2 * gap) / dot_w))
+
+        c.setFillColorRGB(0, 0, 0)
+        c.drawString(left, y, display)
+
+        c.setFillColorRGB(0.6, 0.6, 0.6)
+        c.drawString(left + name_w + gap, y, "." * n_dots)
+
+        c.setFillColorRGB(0, 0, 0)
+        c.drawRightString(right, y, page_str)
+
+        y -= line_h
+
+    c.save()
+    buf.seek(0)
+    output.write_bytes(buf.getvalue())
+    return page_count
+
+
+def _stamp_page_numbers(src: Path, output: Path) -> None:
+    """
+    Overlay a centred "N / Total" footer on every page of *src* and write
+    the result to *output*.
+    """
+    from reportlab.lib.units import mm
+    from reportlab.pdfgen import canvas as rl_canvas
+    from pypdf import PdfReader, PdfWriter
+
+    reader = PdfReader(str(src))
+    total  = len(reader.pages)
+    writer = PdfWriter()
+
+    for i, page in enumerate(reader.pages):
+        w = float(page.mediabox.width)
+        h = float(page.mediabox.height)
+
+        buf = io.BytesIO()
+        c = rl_canvas.Canvas(buf, pagesize=(w, h))
+        c.setFont("Helvetica", 9)
+        c.setFillColorRGB(0.45, 0.45, 0.45)
+        c.drawCentredString(w / 2, 7 * mm, f"{i + 1}  /  {total}")
+        c.save()
+
+        buf.seek(0)
+        overlay = PdfReader(buf).pages[0]
+        page.merge_page(overlay)
+        writer.add_page(page)
+
+    with open(output, "wb") as fh:
+        writer.write(fh)
+
+
+# ---------------------------------------------------------------------------
 # Merger + compression
 # ---------------------------------------------------------------------------
 def _fmt_size(n_bytes: int) -> str:
@@ -334,21 +434,33 @@ def _fmt_size(n_bytes: int) -> str:
     return f"{n_bytes:.1f} TB"
 
 
-def merge_pdfs(pdf_paths: list[Path], output: Path) -> None:
-    """Merge PDF files into one with no compression applied."""
+def merge_pdfs(
+    pdf_paths: list[Path],
+    output: Path,
+    bookmarks: list[tuple[str, int]] | None = None,
+) -> None:
+    """
+    Merge *pdf_paths* into *output*.
+
+    bookmarks : optional list of (title, 0-indexed page number) added as
+                top-level PDF outline entries.
+    """
     from pypdf import PdfWriter
 
     writer = PdfWriter()
     for p in pdf_paths:
         writer.append(str(p))
+
+    if bookmarks:
+        for title, page_idx in bookmarks:
+            writer.add_outline_item(title, page_idx)
+
     with open(output, "wb") as fh:
         writer.write(fh)
 
 
 def _recompress_images(pdf: "pikepdf.Pdf", quality: int) -> None:  # noqa: F821
     """Re-encode every large image in the PDF as JPEG at the given quality."""
-    import io
-
     import pikepdf
     from PIL import Image
 
@@ -365,7 +477,6 @@ def _recompress_images(pdf: "pikepdf.Pdf", quality: int) -> None:  # noqa: F821
         for key in list(xobjects.keys()):
             xobj = xobjects[key]
 
-            # Track indirect objects so shared images are only processed once
             try:
                 objgen = xobj.objgen
                 if objgen in processed:
@@ -379,14 +490,12 @@ def _recompress_images(pdf: "pikepdf.Pdf", quality: int) -> None:  # noqa: F821
 
             try:
                 pdfimage = pikepdf.PdfImage(xobj)
-                pil_img = pdfimage.as_pil_image()
+                pil_img  = pdfimage.as_pil_image()
 
-                # Skip tiny images (icons, logos, etc.)
                 w, h = pil_img.size
                 if w * h < 10_000:
                     continue
 
-                # Flatten transparency for JPEG
                 if pil_img.mode == "RGBA":
                     bg = Image.new("RGB", pil_img.size, (255, 255, 255))
                     bg.paste(pil_img, mask=pil_img.split()[3])
@@ -398,7 +507,6 @@ def _recompress_images(pdf: "pikepdf.Pdf", quality: int) -> None:  # noqa: F821
                 pil_img.save(buf, format="JPEG", quality=quality, optimize=True)
                 jpeg_bytes = buf.getvalue()
 
-                # Only replace if actually smaller than the original stream
                 try:
                     if len(jpeg_bytes) >= len(xobj.read_raw_bytes()):
                         continue
@@ -408,7 +516,7 @@ def _recompress_images(pdf: "pikepdf.Pdf", quality: int) -> None:  # noqa: F821
                 cs = "/DeviceGray" if pil_img.mode == "L" else "/DeviceRGB"
                 xobj.write(jpeg_bytes, filter=pikepdf.Name("/DCTDecode"))
                 xobj["/ColorSpace"] = pikepdf.Name(cs)
-                xobj["/Width"] = w
+                xobj["/Width"]  = w
                 xobj["/Height"] = h
                 xobj["/BitsPerComponent"] = 8
                 for remove_key in ("/DecodeParms", "/SMask", "/Mask", "/Intent"):
@@ -418,7 +526,7 @@ def _recompress_images(pdf: "pikepdf.Pdf", quality: int) -> None:  # noqa: F821
                         pass
 
             except Exception:
-                pass  # Leave images that can't be processed untouched
+                pass  # leave images that can't be processed untouched
 
 
 def compress_pdf(src: Path, output: Path, image_quality: int | None = None) -> None:
@@ -446,8 +554,13 @@ def _execute_merge(
     image_quality: int | None,
     extract_metadata: bool,
     skip_errors: bool,
+    add_bookmarks: bool = False,
+    add_toc: bool = False,
+    add_page_numbers: bool = False,
 ) -> None:
     do_compress = compress or (image_quality is not None)
+    if add_toc:
+        add_bookmarks = True  # TOC always pairs with bookmarks
 
     files = sorted(
         [
@@ -475,14 +588,15 @@ def _execute_merge(
         click.echo(f"  {f.name}")
     click.echo()
 
+    # ── Metadata extraction ────────────────────────────────────────────────
     if extract_metadata:
         image_files = [f for f in files if f.suffix.lower() in IMAGE_EXTS]
         if not image_files:
             click.echo(click.style("No image files found — skipping metadata extraction.", fg="yellow"))
         else:
             meta_path = output_path.with_suffix(".metadata.txt")
-            entries = [(f, extract_image_metadata(f)) for f in image_files]
-            exif_count = write_metadata_file(entries, meta_path)
+            entries_meta = [(f, extract_image_metadata(f)) for f in image_files]
+            exif_count = write_metadata_file(entries_meta, meta_path)
             click.echo(
                 click.style(
                     f"Metadata written: {meta_path}"
@@ -493,22 +607,27 @@ def _execute_merge(
             click.echo()
 
     with tempfile.TemporaryDirectory() as tmp_dir:
-        pdf_parts: list[Path] = []
+
+        # ── Convert files to PDF parts ─────────────────────────────────────
+        converted: list[tuple[Path, Path]] = []  # (original, pdf_part)
 
         for i, f in enumerate(files, 1):
-            ext = f.suffix.lower()
+            ext   = f.suffix.lower()
             label = f"[{i}/{len(files)}] {f.name}"
             try:
                 if ext in IMAGE_EXTS:
-                    pdf_parts.append(image_to_pdf(f, tmp_dir))
+                    part = image_to_pdf(f, tmp_dir)
                 elif ext in PDF_EXTS:
-                    pdf_parts.append(f)
+                    part = f
                 elif ext in WORD_EXTS:
-                    pdf_parts.append(docx_to_pdf(f, tmp_dir))
+                    part = docx_to_pdf(f, tmp_dir)
                 elif ext in EML_EXTS:
-                    pdf_parts.append(eml_to_pdf(f, tmp_dir))
+                    part = eml_to_pdf(f, tmp_dir)
                 elif ext in MSG_EXTS:
-                    pdf_parts.append(msg_to_pdf(f, tmp_dir))
+                    part = msg_to_pdf(f, tmp_dir)
+                else:
+                    continue
+                converted.append((f, part))
                 click.echo(click.style(f"  OK  {label}", fg="green"))
             except Exception as exc:
                 err_msg = f"  ERR {label}: {exc}"
@@ -518,34 +637,92 @@ def _execute_merge(
                     click.echo(click.style(err_msg, fg="red"), err=True)
                     sys.exit(1)
 
-        if not pdf_parts:
+        if not converted:
             click.echo(click.style("No files were successfully converted.", fg="red"), err=True)
             sys.exit(1)
 
+        pdf_parts = [part for _, part in converted]
+
+        # ── Page counts / TOC / bookmarks ──────────────────────────────────
+        bookmarks_list: list[tuple[str, int]] | None = None
+
+        if add_bookmarks or add_toc:
+            click.echo()
+            click.echo("Counting pages ...")
+            page_counts = [_count_pdf_pages(p) for p in pdf_parts]
+
+        if add_toc:
+            click.echo("Generating table of contents ...")
+
+            # First pass: measure how many pages the TOC itself will need.
+            # (Page numbers don't affect page count, so any numbers work here.)
+            draft_toc = Path(tmp_dir) / "_toc_draft.pdf"
+            draft_entries = [
+                (orig.name, 1 + sum(page_counts[:i]))
+                for i, (orig, _) in enumerate(converted)
+            ]
+            toc_n_pages = _generate_toc_pdf(draft_entries, draft_toc)
+
+            # Second pass: correct page numbers now that we know toc_n_pages.
+            toc_path = Path(tmp_dir) / "_toc_final.pdf"
+            toc_entries = [
+                (orig.name, toc_n_pages + 1 + sum(page_counts[:i]))
+                for i, (orig, _) in enumerate(converted)
+            ]
+            _generate_toc_pdf(toc_entries, toc_path)
+
+            # Prepend TOC; update page_counts so bookmark offsets stay correct.
+            pdf_parts   = [toc_path] + pdf_parts
+            page_counts = [toc_n_pages] + page_counts
+
+            # Bookmarks point to the first page of each source file (0-indexed).
+            bookmarks_list = [
+                (orig.name, toc_n_pages + sum(page_counts[1 : 1 + i]))
+                for i, (orig, _) in enumerate(converted)
+            ]
+
+        elif add_bookmarks:
+            cumsum = 0
+            bookmarks_list = []
+            for (orig, _), count in zip(converted, page_counts):
+                bookmarks_list.append((orig.name, cumsum))
+                cumsum += count
+
+        # ── Merge ──────────────────────────────────────────────────────────
         click.echo()
         click.echo(f"Merging {len(pdf_parts)} PDF segment(s) ...")
 
-        if do_compress:
-            raw_path = Path(tmp_dir) / "_merged_raw.pdf"
-            merge_pdfs(pdf_parts, raw_path)
-            raw_size = raw_path.stat().st_size
+        need_tmp = do_compress or add_page_numbers
+        raw_path = Path(tmp_dir) / "_merged_raw.pdf" if need_tmp else output_path
+        merge_pdfs(pdf_parts, raw_path, bookmarks=bookmarks_list)
+        raw_size = raw_path.stat().st_size
+        current  = raw_path
 
+        # ── Page numbers ───────────────────────────────────────────────────
+        if add_page_numbers:
+            click.echo("Stamping page numbers ...")
+            numbered_path = Path(tmp_dir) / "_merged_numbered.pdf"
+            _stamp_page_numbers(current, numbered_path)
+            current = numbered_path
+
+        # ── Compression ────────────────────────────────────────────────────
+        if do_compress:
             if image_quality is not None:
                 click.echo(f"Compressing + recompressing images at quality={image_quality} ...")
             else:
                 click.echo("Compressing (lossless) ...")
-
-            compress_pdf(raw_path, output_path, image_quality=image_quality)
+            compress_pdf(current, output_path, image_quality=image_quality)
             final_size = output_path.stat().st_size
-
             saved = raw_size - final_size
-            pct = (saved / raw_size * 100) if raw_size else 0
+            pct   = (saved / raw_size * 100) if raw_size else 0
             size_info = (
                 f"{_fmt_size(raw_size)} -> {_fmt_size(final_size)}"
                 f"  (saved {_fmt_size(saved)}, {pct:.1f}%)"
             )
+        elif current != output_path:
+            shutil.copy2(str(current), str(output_path))
+            size_info = _fmt_size(output_path.stat().st_size)
         else:
-            merge_pdfs(pdf_parts, output_path)
             size_info = _fmt_size(output_path.stat().st_size)
 
     click.echo()
@@ -569,8 +746,9 @@ def _q_style():
             ("pointer",     "fg:cyan bold"),
             ("highlighted", "fg:cyan bold"),
             ("selected",    "fg:green"),
-            ("instruction", "fg:grey"),
+            ("instruction", "fg:grey italic"),
             ("text",        ""),
+            ("disabled",    "fg:grey italic"),
         ])
     return _Q_STYLE
 
@@ -589,27 +767,19 @@ def interactive_mode() -> None:
 
     click.echo(click.style("\n  Folder PDF Merger\n", bold=True))
 
-    # ── folder ───────────────────────────────────────────────────────────────
-    folder_str = _ask(
-        questionary.path,
-        "Folder to merge:",
-        only_directories=True,
-    )
+    # ── Folder ────────────────────────────────────────────────────────────
+    folder_str  = _ask(questionary.path, "Folder to merge:", only_directories=True)
     folder_path = Path(folder_str).expanduser().resolve()
     if not folder_path.is_dir():
         click.echo(click.style(f"Error: '{folder_path}' is not a directory.", fg="red"))
         sys.exit(1)
 
-    # ── output path ──────────────────────────────────────────────────────────
+    # ── Output path ───────────────────────────────────────────────────────
     default_out = str(folder_path / f"{folder_path.name}.pdf")
-    output_str = _ask(
-        questionary.text,
-        "Output PDF path:",
-        default=default_out,
-    )
+    output_str  = _ask(questionary.text, "Output PDF path:", default=default_out)
     output_path = Path(output_str).expanduser()
 
-    # ── compression mode ─────────────────────────────────────────────────────
+    # ── Compression ───────────────────────────────────────────────────────
     compress_choice = _ask(
         questionary.select,
         "Compression:",
@@ -630,11 +800,26 @@ def interactive_mode() -> None:
         )
         image_quality = int(quality_str)
 
-    # ── extra options ─────────────────────────────────────────────────────────
-    extract_metadata = _ask(questionary.confirm, "Extract image metadata to a .txt file?", default=False)
-    skip_errors      = _ask(questionary.confirm, "Skip files that fail to convert?",       default=False)
+    # ── Output options (multi-select checkbox) ────────────────────────────
+    extra_opts: list[str] = _ask(
+        questionary.checkbox,
+        "Output options:  (Space to toggle, Enter to confirm)",
+        choices=[
+            questionary.Choice("Add PDF bookmarks  (one per source file)",            value="bookmarks"),
+            questionary.Choice("Add table of contents page  (implies bookmarks)",     value="toc"),
+            questionary.Choice("Stamp page numbers  (N / Total at page bottom)",      value="page_numbers"),
+            questionary.Choice("Extract image EXIF metadata  (writes .txt file)",     value="metadata"),
+            questionary.Choice("Skip files that fail to convert  (default: abort)",   value="skip_errors"),
+        ],
+    )
 
-    # ── summary + confirm ────────────────────────────────────────────────────
+    add_toc          = "toc"          in extra_opts
+    add_bookmarks    = "bookmarks"    in extra_opts or add_toc
+    add_page_numbers = "page_numbers" in extra_opts
+    extract_metadata = "metadata"     in extra_opts
+    skip_errors      = "skip_errors"  in extra_opts
+
+    # ── Summary + confirm ─────────────────────────────────────────────────
     click.echo()
     click.echo(click.style("  Summary", bold=True))
     click.echo(f"  Folder     : {folder_path}")
@@ -645,8 +830,19 @@ def interactive_mode() -> None:
         click.echo( "  Compression: Lossless")
     else:
         click.echo(f"  Compression: Images at quality {image_quality}")
-    click.echo(f"  Metadata   : {'Yes' if extract_metadata else 'No'}")
-    click.echo(f"  On error   : {'Skip' if skip_errors else 'Abort'}")
+
+    flags = []
+    if add_bookmarks:
+        flags.append("bookmarks")
+    if add_toc:
+        flags.append("TOC")
+    if add_page_numbers:
+        flags.append("page numbers")
+    if extract_metadata:
+        flags.append("metadata")
+    if skip_errors:
+        flags.append("skip errors")
+    click.echo(f"  Options    : {', '.join(flags) if flags else 'none'}")
     click.echo()
 
     if not _ask(questionary.confirm, "Proceed?", default=True):
@@ -661,6 +857,9 @@ def interactive_mode() -> None:
         image_quality=image_quality,
         extract_metadata=extract_metadata,
         skip_errors=skip_errors,
+        add_bookmarks=add_bookmarks,
+        add_toc=add_toc,
+        add_page_numbers=add_page_numbers,
     )
 
 
@@ -670,17 +869,30 @@ def interactive_mode() -> None:
 @click.command(context_settings={"help_option_names": ["-h", "--help"]})
 @click.argument("folder", required=False, default=None,
                 type=click.Path(exists=False, file_okay=False))
-@click.option("-o", "--output",        default=None, help="Output PDF path. Defaults to <folder>/<folder_name>.pdf")
-@click.option("--compress",            is_flag=True, default=False, help="Lossless compression: deflate streams + deduplicate objects.")
-@click.option("--image-quality",       type=click.IntRange(1, 95),  default=None, metavar="1-95",
+@click.option("-o", "--output",        default=None,
+              help="Output PDF path. Defaults to <folder>/<folder_name>.pdf")
+@click.option("--compress",            is_flag=True, default=False,
+              help="Lossless compression: deflate streams + deduplicate objects.")
+@click.option("--image-quality",       type=click.IntRange(1, 95), default=None, metavar="1-95",
               help="Re-encode images as JPEG at this quality (implies --compress). 85=high, 60=medium, 40=small.")
-@click.option("--extract-metadata",    is_flag=True, default=False, help="Save EXIF/image metadata to a .txt file alongside the output PDF.")
-@click.option("--skip-errors",         is_flag=True, default=False, help="Skip files that fail to convert instead of aborting.")
+@click.option("--bookmarks",           is_flag=True, default=False,
+              help="Add a PDF bookmark (outline entry) for each source file.")
+@click.option("--toc",                 is_flag=True, default=False,
+              help="Prepend a Table of Contents page (implies --bookmarks).")
+@click.option("--page-numbers",        is_flag=True, default=False,
+              help="Stamp 'N / Total' page numbers at the bottom of every page.")
+@click.option("--extract-metadata",    is_flag=True, default=False,
+              help="Save EXIF/image metadata to a .txt file alongside the output PDF.")
+@click.option("--skip-errors",         is_flag=True, default=False,
+              help="Skip files that fail to convert instead of aborting.")
 def main(
     folder: str | None,
     output: str | None,
     compress: bool,
     image_quality: int | None,
+    bookmarks: bool,
+    toc: bool,
+    page_numbers: bool,
     extract_metadata: bool,
     skip_errors: bool,
 ) -> None:
@@ -693,6 +905,10 @@ def main(
     Compression options:
       --compress              lossless (structure only)
       --image-quality 85      lossy image recompression — best for scans/photos
+    Navigation options:
+      --bookmarks             PDF outline entry per source file
+      --toc                   Table of contents page (implies --bookmarks)
+      --page-numbers          Stamp N / Total footer on every page
     """
     if folder is None:
         interactive_mode()
@@ -704,7 +920,17 @@ def main(
         sys.exit(1)
 
     output_path = Path(output) if output else folder_path / f"{folder_path.name}.pdf"
-    _execute_merge(folder_path, output_path, compress, image_quality, extract_metadata, skip_errors)
+    _execute_merge(
+        folder_path,
+        output_path,
+        compress,
+        image_quality,
+        extract_metadata,
+        skip_errors,
+        add_bookmarks=bookmarks or toc,
+        add_toc=toc,
+        add_page_numbers=page_numbers,
+    )
 
 
 if __name__ == "__main__":
