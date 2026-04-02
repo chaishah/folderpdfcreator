@@ -12,6 +12,7 @@ Supported formats:
 
 import html
 import io
+import math
 import re
 import shutil
 import sys
@@ -95,10 +96,86 @@ def image_to_pdf(src: Path, tmp_dir: str) -> Path:
     from PIL import Image
 
     out = Path(tmp_dir) / f"{src.stem}_img.pdf"
-    img = Image.open(src)
+    img = _open_normalized_image(src)
     if img.mode not in ("RGB", "L"):
         img = img.convert("RGB")
     img.save(out, "PDF", resolution=150)
+    return out
+
+
+def _open_normalized_image(src: Path):
+    """Open an image with EXIF orientation applied and a detached pixel buffer."""
+    from PIL import Image, ImageOps
+
+    with Image.open(src) as img:
+        return ImageOps.exif_transpose(img).copy()
+
+
+def images_to_grid_pdf(srcs: list[Path], tmp_dir: str, cols: int, batch_idx: int) -> Path:
+    """
+    Place up to *cols* × rows images on a single A4 page arranged in a grid.
+    Images that cannot be opened are replaced with a grey placeholder cell.
+    """
+    from PIL import Image as PILImage
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.units import mm
+    from reportlab.lib.utils import ImageReader
+    from reportlab.pdfgen import canvas as rl_canvas
+
+    rows  = math.ceil(len(srcs) / cols)
+    W, H  = A4
+    margin = 8 * mm
+    gap    = 4 * mm
+
+    cell_w = (W - 2 * margin - (cols - 1) * gap) / cols
+    cell_h = (H - 2 * margin - (rows - 1) * gap) / rows
+
+    out = Path(tmp_dir) / f"_grid_{batch_idx:04d}.pdf"
+    buf = io.BytesIO()
+    c   = rl_canvas.Canvas(buf, pagesize=A4)
+
+    for idx, src in enumerate(srcs):
+        col = idx % cols
+        row = idx // cols
+        # ReportLab's origin is bottom-left
+        cell_x = margin + col * (cell_w + gap)
+        cell_y = H - margin - (row + 1) * cell_h - row * gap
+
+        try:
+            img = _open_normalized_image(src)
+            if img.mode == "RGBA":
+                bg = PILImage.new("RGB", img.size, (255, 255, 255))
+                bg.paste(img, mask=img.split()[3])
+                img = bg
+            elif img.mode not in ("RGB", "L"):
+                img = img.convert("RGB")
+
+            # Resize to the cell's print resolution (150 DPI) before embedding.
+            # Without this, a 4000 × 3000 px photo embeds as ~40 MB of raw pixels
+            # even when the cell is only a few hundred pixels wide.
+            max_w = max(1, int(cell_w / 72 * 150))
+            max_h = max(1, int(cell_h / 72 * 150))
+            img.thumbnail((max_w, max_h), PILImage.LANCZOS)
+
+            c.drawImage(
+                ImageReader(img),
+                cell_x, cell_y, width=cell_w, height=cell_h,
+                preserveAspectRatio=True, anchor="c",
+            )
+        except Exception as img_err:
+            # Warn and draw a grey placeholder so the rest of the grid still renders
+            import warnings
+            warnings.warn(f"Could not render '{src.name}' in grid: {img_err}")
+            c.setFillColorRGB(0.88, 0.88, 0.88)
+            c.rect(cell_x, cell_y, cell_w, cell_h, fill=1, stroke=0)
+            c.setFillColorRGB(0.45, 0.45, 0.45)
+            c.setFont("Helvetica", 7)
+            label = src.name if len(src.name) <= 30 else src.name[:27] + "..."
+            c.drawCentredString(cell_x + cell_w / 2, cell_y + cell_h / 2, label)
+
+    c.save()
+    buf.seek(0)
+    out.write_bytes(buf.getvalue())
     return out
 
 
@@ -423,6 +500,42 @@ def _stamp_page_numbers(src: Path, output: Path) -> None:
         writer.write(fh)
 
 
+def _standardize_page_sizes(src: Path, output: Path, size_name: str) -> None:
+    """Scale and center all pages in the PDF onto a standard page size (A4 / Letter)."""
+    from pypdf import PdfReader, PdfWriter, Transformation
+    from reportlab.lib.pagesizes import A4, LETTER
+
+    target_w, target_h = A4 if size_name.lower() == "a4" else LETTER
+
+    reader = PdfReader(str(src))
+    writer = PdfWriter()
+    writer.clone_document_from_reader(reader)
+
+    for page in writer.pages:
+        orig_w = float(page.mediabox.width)
+        orig_h = float(page.mediabox.height)
+        if orig_w == 0 or orig_h == 0:
+            continue
+            
+        scale = min(target_w / orig_w, target_h / orig_h)
+        tx = (target_w - orig_w * scale) / 2.0
+        ty = (target_h - orig_h * scale) / 2.0
+        
+        op = Transformation().scale(scale, scale).translate(tx, ty)
+        page.add_transformation(op)
+        
+        page.mediabox.lower_left = (0, 0)
+        page.mediabox.upper_right = (target_w, target_h)
+        page.cropbox.lower_left = (0, 0)
+        page.cropbox.upper_right = (target_w, target_h)
+        page.bleedbox = page.cropbox
+        page.trimbox = page.cropbox
+        page.artbox = page.cropbox
+
+    with open(output, "wb") as fh:
+        writer.write(fh)
+
+
 # ---------------------------------------------------------------------------
 # Merger + compression
 # ---------------------------------------------------------------------------
@@ -557,6 +670,8 @@ def _execute_merge(
     add_bookmarks: bool = False,
     add_toc: bool = False,
     add_page_numbers: bool = False,
+    page_size: str | None = None,
+    images_per_page: int = 1,
 ) -> None:
     do_compress = compress or (image_quality is not None)
     if add_toc:
@@ -606,18 +721,54 @@ def _execute_merge(
             )
             click.echo()
 
+    # Pre-compute grid columns (used in conversion loop below)
+    grid_cols = math.ceil(math.sqrt(images_per_page)) if images_per_page > 1 else 1
+
     with tempfile.TemporaryDirectory() as tmp_dir:
 
         # ── Convert files to PDF parts ─────────────────────────────────────
-        converted: list[tuple[Path, Path]] = []  # (original, pdf_part)
+        # segments    : unique PDF files in merge order (no duplicates)
+        # file_entries: (original_file, its_segment) — one entry per source file
+        segments:    list[Path]             = []
+        file_entries: list[tuple[Path, Path]] = []
+        image_batch: list[Path]             = []
+        batch_counter                       = 0
+
+        def _flush_image_batch() -> None:
+            nonlocal batch_counter
+            if not image_batch:
+                return
+            if images_per_page == 1:
+                for img_path in image_batch:
+                    part = image_to_pdf(img_path, tmp_dir)
+                    segments.append(part)
+                    file_entries.append((img_path, part))
+            else:
+                for start in range(0, len(image_batch), images_per_page):
+                    batch = image_batch[start : start + images_per_page]
+                    part = images_to_grid_pdf(batch, tmp_dir, grid_cols, batch_counter)
+                    batch_counter += 1
+                    segments.append(part)
+                    for img_path in batch:
+                        file_entries.append((img_path, part))
+            image_batch.clear()
 
         for i, f in enumerate(files, 1):
             ext   = f.suffix.lower()
             label = f"[{i}/{len(files)}] {f.name}"
             try:
                 if ext in IMAGE_EXTS:
-                    part = image_to_pdf(f, tmp_dir)
-                elif ext in PDF_EXTS:
+                    image_batch.append(f)
+                    # Flush eagerly when a full grid page is ready
+                    if images_per_page > 1 and len(image_batch) == images_per_page:
+                        _flush_image_batch()
+                    click.echo(click.style(f"  OK  {label}", fg="green"))
+                    continue
+
+                # Non-image: flush any pending images first to preserve sort order
+                _flush_image_batch()
+
+                if ext in PDF_EXTS:
                     part = f
                 elif ext in WORD_EXTS:
                     part = docx_to_pdf(f, tmp_dir)
@@ -627,7 +778,8 @@ def _execute_merge(
                     part = msg_to_pdf(f, tmp_dir)
                 else:
                     continue
-                converted.append((f, part))
+                segments.append(part)
+                file_entries.append((f, part))
                 click.echo(click.style(f"  OK  {label}", fg="green"))
             except Exception as exc:
                 err_msg = f"  ERR {label}: {exc}"
@@ -637,11 +789,20 @@ def _execute_merge(
                     click.echo(click.style(err_msg, fg="red"), err=True)
                     sys.exit(1)
 
-        if not converted:
+        # Flush any images left at the end of the file list
+        try:
+            _flush_image_batch()
+        except Exception as exc:
+            if not skip_errors:
+                click.echo(click.style(f"  ERR (grid assembly): {exc}", fg="red"), err=True)
+                sys.exit(1)
+            click.echo(click.style(f"  ERR (grid assembly): {exc}", fg="yellow"), err=True)
+
+        if not segments:
             click.echo(click.style("No files were successfully converted.", fg="red"), err=True)
             sys.exit(1)
 
-        pdf_parts = [part for _, part in converted]
+        pdf_parts = list(dict.fromkeys(segments))  # deduplicated, order preserved
 
         # ── Page counts / TOC / bookmarks ──────────────────────────────────
         bookmarks_list: list[tuple[str, int]] | None = None
@@ -649,54 +810,58 @@ def _execute_merge(
         if add_bookmarks or add_toc:
             click.echo()
             click.echo("Counting pages ...")
-            page_counts = [_count_pdf_pages(p) for p in pdf_parts]
+            seg_page_counts = [_count_pdf_pages(s) for s in pdf_parts]
+
+            # Map each segment path → its starting page index in the merged PDF
+            seg_start: dict[Path, int] = {}
+            cumsum = 0
+            for seg, count in zip(pdf_parts, seg_page_counts):
+                seg_start[seg] = cumsum
+                cumsum += count
 
         if add_toc:
             click.echo("Generating table of contents ...")
 
-            # First pass: measure how many pages the TOC itself will need.
-            # (Page numbers don't affect page count, so any numbers work here.)
-            draft_toc = Path(tmp_dir) / "_toc_draft.pdf"
-            draft_entries = [
-                (orig.name, 1 + sum(page_counts[:i]))
-                for i, (orig, _) in enumerate(converted)
-            ]
-            toc_n_pages = _generate_toc_pdf(draft_entries, draft_toc)
+            # First pass: measure how many pages the TOC itself needs.
+            draft_toc     = Path(tmp_dir) / "_toc_draft.pdf"
+            draft_entries = [(orig.name, 1 + seg_start[seg]) for orig, seg in file_entries]
+            toc_n_pages   = _generate_toc_pdf(draft_entries, draft_toc)
 
-            # Second pass: correct page numbers now that we know toc_n_pages.
-            toc_path = Path(tmp_dir) / "_toc_final.pdf"
-            toc_entries = [
-                (orig.name, toc_n_pages + 1 + sum(page_counts[:i]))
-                for i, (orig, _) in enumerate(converted)
-            ]
+            # Second pass: regenerate with correct page numbers (offset by toc_n_pages).
+            toc_path    = Path(tmp_dir) / "_toc_final.pdf"
+            toc_entries = [(orig.name, toc_n_pages + 1 + seg_start[seg]) for orig, seg in file_entries]
             _generate_toc_pdf(toc_entries, toc_path)
 
-            # Prepend TOC; update page_counts so bookmark offsets stay correct.
-            pdf_parts   = [toc_path] + pdf_parts
-            page_counts = [toc_n_pages] + page_counts
+            pdf_parts = [toc_path] + pdf_parts
 
-            # Bookmarks point to the first page of each source file (0-indexed).
+            # Bookmarks point to each file's first page (0-indexed, after TOC).
             bookmarks_list = [
-                (orig.name, toc_n_pages + sum(page_counts[1 : 1 + i]))
-                for i, (orig, _) in enumerate(converted)
+                (orig.name, toc_n_pages + seg_start[seg])
+                for orig, seg in file_entries
             ]
 
         elif add_bookmarks:
-            cumsum = 0
-            bookmarks_list = []
-            for (orig, _), count in zip(converted, page_counts):
-                bookmarks_list.append((orig.name, cumsum))
-                cumsum += count
+            bookmarks_list = [
+                (orig.name, seg_start[seg])
+                for orig, seg in file_entries
+            ]
 
         # ── Merge ──────────────────────────────────────────────────────────
         click.echo()
         click.echo(f"Merging {len(pdf_parts)} PDF segment(s) ...")
 
-        need_tmp = do_compress or add_page_numbers
+        need_tmp = do_compress or add_page_numbers or (page_size is not None)
         raw_path = Path(tmp_dir) / "_merged_raw.pdf" if need_tmp else output_path
         merge_pdfs(pdf_parts, raw_path, bookmarks=bookmarks_list)
         raw_size = raw_path.stat().st_size
         current  = raw_path
+
+        # ── Standardize Page Sizes ─────────────────────────────────────────
+        if page_size and page_size.lower() in ("a4", "letter"):
+            click.echo(f"Standardizing page sizes to {page_size.upper()} ...")
+            resized_path = Path(tmp_dir) / "_merged_resized.pdf"
+            _standardize_page_sizes(current, resized_path, page_size)
+            current = resized_path
 
         # ── Page numbers ───────────────────────────────────────────────────
         if add_page_numbers:
@@ -800,6 +965,31 @@ def interactive_mode() -> None:
         )
         image_quality = int(quality_str)
 
+    # ── Images per page ───────────────────────────────────────────────────
+    images_per_page = int(_ask(
+        questionary.select,
+        "Images per page:",
+        choices=[
+            questionary.Choice("1  —  one image per page (default)",        value="1"),
+            questionary.Choice("2  —  two images side by side  (2 × 1)",    value="2"),
+            questionary.Choice("4  —  grid  (2 × 2)",                       value="4"),
+            questionary.Choice("6  —  grid  (3 × 2)",                       value="6"),
+            questionary.Choice("9  —  grid  (3 × 3)",                       value="9"),
+        ],
+    ))
+
+    # ── Page Size ─────────────────────────────────────────────────────────
+    page_size_choice = _ask(
+        questionary.select,
+        "Standardize page sizes (scales & centers pages uniformly):",
+        choices=[
+            questionary.Choice("None  —  keep original sizes", value="none"),
+            questionary.Choice("A4",                             value="A4"),
+            questionary.Choice("US Letter",                      value="Letter"),
+        ],
+    )
+    page_size = None if page_size_choice == "none" else page_size_choice
+
     # ── Output options (multi-select checkbox) ────────────────────────────
     extra_opts: list[str] = _ask(
         questionary.checkbox,
@@ -830,6 +1020,9 @@ def interactive_mode() -> None:
         click.echo( "  Compression: Lossless")
     else:
         click.echo(f"  Compression: Images at quality {image_quality}")
+        
+    click.echo(f"  Page Size  : {page_size if page_size else 'Original'}")
+    click.echo(f"  Images/page: {images_per_page}")
 
     flags = []
     if add_bookmarks:
@@ -860,6 +1053,8 @@ def interactive_mode() -> None:
         add_bookmarks=add_bookmarks,
         add_toc=add_toc,
         add_page_numbers=add_page_numbers,
+        page_size=page_size,
+        images_per_page=images_per_page,
     )
 
 
@@ -885,6 +1080,10 @@ def interactive_mode() -> None:
               help="Save EXIF/image metadata to a .txt file alongside the output PDF.")
 @click.option("--skip-errors",         is_flag=True, default=False,
               help="Skip files that fail to convert instead of aborting.")
+@click.option("--page-size",           type=click.Choice(["A4", "Letter"], case_sensitive=False), default=None,
+              help="Standardize all pages to A4 or Letter (scales and centers content).")
+@click.option("--images-per-page",     type=click.Choice(["1", "2", "4", "6", "9"]), default="1",
+              help="How many images to place on each PDF page (grid layout). Default: 1.")
 def main(
     folder: str | None,
     output: str | None,
@@ -895,6 +1094,8 @@ def main(
     page_numbers: bool,
     extract_metadata: bool,
     skip_errors: bool,
+    page_size: str | None,
+    images_per_page: str,
 ) -> None:
     """Merge all supported files in FOLDER into a single PDF.
 
@@ -909,6 +1110,8 @@ def main(
       --bookmarks             PDF outline entry per source file
       --toc                   Table of contents page (implies --bookmarks)
       --page-numbers          Stamp N / Total footer on every page
+    Image layout:
+      --images-per-page 4     Place 4 images per page in a 2×2 grid (also 2, 6, 9)
     """
     if folder is None:
         interactive_mode()
@@ -930,6 +1133,8 @@ def main(
         add_bookmarks=bookmarks or toc,
         add_toc=toc,
         add_page_numbers=page_numbers,
+        page_size=page_size,
+        images_per_page=int(images_per_page),
     )
 
 
