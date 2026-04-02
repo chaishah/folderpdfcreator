@@ -1,201 +1,129 @@
-# Folder PDF Merger
+# 📂 Folder PDF Merger
 
-Merges all supported files in a folder into a single PDF, sorted numerically by filename.
+> A powerful, interactive command-line tool that merges all supported files in a folder into a single, beautifully formatted PDF. Automatically handles images, office documents, emails, and PDFs, sorting them perfectly.
 
-## Supported file types
+[![Python Version](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://python.org)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-| Category | Extensions |
-|----------|-----------|
-| Images | `.png`, `.jpg`, `.jpeg`, `.bmp`, `.tiff`, `.tif`, `.gif`, `.webp` |
-| PDF | `.pdf` |
-| Word | `.docx`, `.doc` |
-| Email (MIME) | `.eml` |
-| Outlook email | `.msg` |
+---
 
-## Installation
+## ✨ Features
+- 🗂️ **Format Flexibility:** Merges Images (`.jpg`, `.png`, etc.), Word (`.docx`), Emails (`.eml`, `.msg`), and PDFs.
+- 📑 **Smart Formatting:** Automatically generates a **Table of Contents**, sets up **Bookmarks**, and stamps **Page Numbers** (`N / Total`).
+- 🗜️ **Deep Compression:** Lossless object deflation configures right alongside smart image re-compression (`JPEG` with custom quality) for huge space savings.
+- 🔎 **Metadata Extraction:** Rips EXIF data and GPS coordinates from images to a separate `.metadata.txt` file.
+- 🪄 **Interactive Mode:** A beautiful, terminal-based selection menu means you don't have to memorize a single command flag!
+
+---
+
+## 🎥 Watch it in Action
+
+*(Upload a screen recording via terminal tools like [Asciinema](https://asciinema.org/) or VHS, and replace the placeholder GIF link below)*
+
+![Demo of Interactive Mode](https://raw.githubusercontent.com/your-username/your-repo/main/demo.gif)
+
+```text
+? Folder to merge: ./Quarterly_Reports
+? Output PDF path: ./Quarterly_Reports.pdf
+? Compression: Image recompression  —  re-encode as JPEG (best for scans)
+? Image quality (1-95): 85
+? Output options:  (Space to toggle, Enter to confirm)
+ ◯ Add PDF bookmarks  (one per source file)
+ ◉ Add table of contents page  (implies bookmarks)
+ ◉ Stamp page numbers  (N / Total at page bottom)
+ ◯ Extract image EXIF metadata  (writes .txt file)
+ ◯ Skip files that fail to convert  (default: abort)
+```
+
+---
+
+## 🛠️ Installation
 
 ```bash
+# Install dependencies
 pip install -r requirements.txt
 ```
 
-> **Word documents (.doc / .docx):** conversion uses Microsoft Word via COM automation (`docx2pdf`). If Word is not installed, the tool falls back to plain-text extraction.
+> 💡 **Word documents (`.doc` / `.docx`):** Conversion uses Microsoft Word via COM automation (`docx2pdf`). If Word is not installed, the tool will fall back to plain-text extraction automatically.
 
-## Usage
+---
 
-### Interactive mode (recommended)
+## 🚀 Usage
 
-Run with no arguments to launch the interactive prompt — no flags to memorise:
+### 🪄 Interactive Mode (Highly Recommended)
+
+Run with no arguments to launch the interactive prompt. 
 
 ```bash
 python merge_to_pdf.py
 ```
 
-Use arrow keys to navigate, Enter to confirm. The prompt walks you through:
+Use your arrow keys to navigate and `Enter` to confirm. The prompt smoothly guides you through:
+1. **Target Folder** (with tab-completion)
+2. **Output Path** (pre-filled smartly)
+3. **Compression Level** (None, Lossless, or Lossy Image Re-compression)
+4. **Navigational Add-ons** (TOC, Bookmarks, Page Numbers)
+5. **Metadata & Error Handling**
 
-1. **Folder** — path with tab-completion
-2. **Output path** — pre-filled with the default, edit if needed
-3. **Compression** — choose with arrow keys:
-   - None (merge only)
-   - Lossless (deflate + deduplicate)
-   - Image recompression (re-encode as JPEG — best for scans/photos)
-4. **Image quality** — shown only when image recompression is selected
-5. **Extract metadata** — yes/no
-6. **Skip errors** — yes/no
-7. **Summary + confirm** before anything runs
+### 💻 Command-line Mode
 
-### Command-line mode
+Perfect for scripts, aliases, or CI pipelines.
 
 ```bash
 python merge_to_pdf.py FOLDER [OPTIONS]
 ```
 
-#### Arguments
+| Argument / Option | Description |
+|-------------------|-------------|
+| `FOLDER` | Target folder containing the files to merge. |
+| `-o, --output PATH` | Output PDF path (Defaults to `<folder>/<folder_name>.pdf`) |
+| `--bookmarks` | Add a PDF bookmark (outline entry) for each source file. 🔖|
+| `--toc` | Prepend a beautifully formatted Table of Contents page (implies `--bookmarks`). 📑 |
+| `--page-numbers` | Stamp '`N / Total`' footer page numbers at the bottom of every page. 🔢 |
+| `--compress` | Lossless compression (deflate streams, deduplicate objects). Best for Text/Vector PDFs. |
+| `--image-quality [1-95]` | Re-encode embedded images as JPEG at specific quality (implies `--compress`). Ideal for scans. |
+| `--extract-metadata` | Extract EXIF/image metadata from all images and save to `.metadata.txt`. |
+| `--skip-errors` | Skip broken files instead of aborting the entire run. |
+| `-h, --help` | Show help and exit |
 
-| Argument | Description |
-|----------|-------------|
-| `FOLDER` | Path to the folder containing the files to merge |
+---
 
-#### Options
+## 📖 Examples
 
-| Option | Description |
-|--------|-------------|
-| `-o, --output PATH` | Output PDF path. Defaults to `<folder>/<folder_name>.pdf` |
-| `--compress` | Lossless compression — deflates streams and deduplicates objects. Best for text/vector PDFs. |
-| `--image-quality 1-95` | Re-encodes all embedded images as JPEG at the given quality (implies `--compress`). Best for scans and photos. |
-| `--extract-metadata` | Extract EXIF/image metadata from all image files and save to a `.metadata.txt` file alongside the output PDF. |
-| `--skip-errors` | Skip files that fail to convert instead of aborting the whole run. |
-| `-h, --help` | Show help and exit. |
-
-## Examples
-
-**Interactive mode:**
+**Complete document assembly with TOC and Page Numbers:**
 ```bash
-python merge_to_pdf.py
+python merge_to_pdf.py "C:\path\to\MyFolder" --toc --page-numbers
 ```
 
-**Basic merge** — output saved to `MyFolder/MyFolder.pdf`:
+**Heavy compression for scanned archives:**
 ```bash
-python merge_to_pdf.py "C:\path\to\MyFolder"
-```
-
-**Custom output path:**
-```bash
-python merge_to_pdf.py "C:\path\to\MyFolder" -o "C:\output\merged.pdf"
-```
-
-**Lossless compression** (good for text-heavy PDFs):
-```bash
-python merge_to_pdf.py "C:\path\to\MyFolder" --compress
-```
-
-**Image recompression** (best for scans and photos):
-```bash
-# High quality — moderate savings
-python merge_to_pdf.py "C:\path\to\MyFolder" --image-quality 85
-
-# Medium quality — good savings
 python merge_to_pdf.py "C:\path\to\MyFolder" --image-quality 60
-
-# Small file — visible quality loss
-python merge_to_pdf.py "C:\path\to\MyFolder" --image-quality 40
 ```
 
-**Extract image metadata to a text file:**
+**Extract metadata to a text file:**
 ```bash
 python merge_to_pdf.py "C:\path\to\MyFolder" --extract-metadata
 ```
 
-**Combine metadata extraction with compression:**
+**Skip broken/corrupted files:**
 ```bash
-python merge_to_pdf.py "C:\path\to\MyFolder" --extract-metadata --image-quality 85
+python merge_to_pdf.py "C:\path\to\MyFolder" --skip-errors
 ```
 
-**Skip broken files instead of aborting:**
-```bash
-python merge_to_pdf.py "C:\path\to\MyFolder" --image-quality 85 --skip-errors
-```
+---
 
-## How files are sorted
+## 🧠 Behind the Scenes
 
-Files are sorted **numerically** by filename, so `10.pdf` comes after `9.pdf` (not after `1.pdf`). Mixed names like `1.png`, `2.docx`, `3.jpg`, `10.pdf` are ordered correctly.
+### 📂 How files are sorted
+Files are sorted strictly **numerically**, ensuring `10.png` comes after `9.jpg` (not after `1.pdf`). Mixed extensions sequence correctly! The tool automatically excludes the newly created output PDF so running it multiple times in the same directory won't cause infinite recursion errors.
 
-The output file is automatically excluded from the input list, so running the command twice on the same folder won't merge the previous output into itself.
+### 🗜️ Compression Guide
+- Images that would end up **larger** after re-compression will automatically be kept in their original encoding.
+- Tiny graphics (like icon files or signatures < 100×100 px) are automatically skipped to preserve edge quality.
 
-## Compression guide
+### 📝 Document Navigation & Formatting
+- **Table of Contents (`--toc`)**: Scans all output items and automatically calculates the right page mapping to prepend a styled Title layout + TOC matching your file's pagination layout.
+- **Page Numbering (`--page-numbers`)**: Dynamically overlays a transparent canvas layer placing `N / Total` dead-center at the bottom of each page without disturbing existing margins.
 
-| Flag | How it works | When to use |
-|------|-------------|-------------|
-| *(none)* | No compression | Files are already small / optimised |
-| `--compress` | Lossless: deflate + deduplication via `pikepdf` | Text, vectors, mixed documents |
-| `--image-quality 85` | Lossy JPEG re-encoding of all embedded images | Scanned documents, photos |
-| `--image-quality 60` | Same, more aggressive | Large scan archives |
-
-- Images that end up **larger** after recompression are kept at their original encoding automatically.
-- Tiny images (icons, signatures < 100×100 px) are skipped to preserve quality.
-- `--image-quality` always implies `--compress`.
-
-## Metadata extraction
-
-When `--extract-metadata` is passed, a `<output_name>.metadata.txt` file is written alongside the PDF containing:
-
-- **Basic info** (always): filename, format, colour mode, dimensions, file size
-- **EXIF data** (when present): date taken, camera make/model, exposure time, f-number, ISO, focal length, lens model, GPS coordinates, and more
-
-Files with no EXIF data (e.g. screenshots, programmatically generated PNGs) still get their basic info recorded. Only image files are included — PDFs, Word docs, and emails are skipped.
-
-**Example output (`MyFolder.metadata.txt`):**
-```
-Image Metadata Report
-Generated from: C:\path\to\MyFolder
-========================================================================
-
-========================================================================
-  1.jpg
-========================================================================
-  Filename         : 1.jpg
-  Format           : JPEG
-  Mode             : RGB
-  Dimensions       : 4032 x 3024 px
-  File size        : 4.2 MB
-  Date modified    : 2024:03:15 14:32:11
-  Date taken       : 2024:03:15 14:32:11
-  Camera make      : Apple
-  Camera model     : iPhone 15 Pro
-  Exposure time    : 1/120
-  F-number         : 18/10
-  ISO              : 200
-  GPS coordinates  : 37.774967 N, 122.419467 W
-
-========================================================================
-  2.png
-========================================================================
-  Filename    : 2.png
-  Format      : PNG
-  Mode        : RGB
-  Dimensions  : 1920 x 1080 px
-  File size   : 890.4 KB
-```
-
-## Output
-
-The tool prints a progress line for every file and a final size report:
-
-```
-Found 5 file(s):
-  1.jpg
-  2.jpg
-  3.pdf
-  4.docx
-  5.eml
-
-  OK  [1/5] 1.jpg
-  OK  [2/5] 2.jpg
-  OK  [3/5] 3.pdf
-  OK  [4/5] 4.docx
-  OK  [5/5] 5.eml
-
-Merging 5 PDF segment(s) ...
-Compressing + recompressing images at quality=85 ...
-
-Done! -> C:\path\to\MyFolder\MyFolder.pdf  [12.4 MB -> 4.9 MB  (saved 7.6 MB, 60.9%)]
-```
+---
+*Happy Merging! 🎉*
